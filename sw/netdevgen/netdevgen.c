@@ -9,6 +9,8 @@
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/ip.h>
+#include <linux/proc_fs.h>
+#include <asm/atomic.h>
 #include <net/ip.h>
 #include <net/route.h>
 #include <net/net_namespace.h>
@@ -29,6 +31,12 @@ static __be32 srcip = 0x010010AC; /* 172.16.0.1 */
 static __be32 dstip = 0x020010AC; /* 172.16.0.2 */
 
 
+#define PROC_NAME "driver/netdevgen"
+
+static atomic_t start;
+
+
+
 static int
 netdevgen_thread (void * arg)
 {
@@ -42,16 +50,6 @@ netdevgen_thread (void * arg)
 
 	if (!net) {
 		printk ("failed to get netns by pid 1\n");
-		goto err_out;
-	}
-
-	memset (&fl4, 0, sizeof (fl4));
-	fl4.saddr = srcip;
-	fl4.daddr = dstip;
-
-	rt = ip_route_output_key (net, &fl4);
-	if (IS_ERR (rt)) {
-		printk ("no route to %pI4\n", &dstip);
 		goto err_out;
 	}
 
@@ -74,10 +72,24 @@ netdevgen_thread (void * arg)
 	ip->saddr = srcip;
 	ip->daddr = dstip;
 
+	memset (&fl4, 0, sizeof (fl4));
+	fl4.saddr = srcip;
+	fl4.daddr = dstip;
+	rt = ip_route_output_key (net, &fl4);
+	if (IS_ERR (rt)) {
+		printk ("no route to %pI4\n", &dstip);
+		goto err_out;
+	}
 	skb_dst_drop (skb);
 	skb_dst_set (skb, &rt->dst);
 
+
 	while (!kthread_should_stop ()) {
+
+		if (atomic_read (&start) == 0) {
+			break;
+		}
+
 		pskb = skb_clone (skb, GFP_KERNEL);
 		if (!pskb) {
 			printk (KERN_ERR "failed to clone skb\n");
@@ -87,24 +99,69 @@ netdevgen_thread (void * arg)
 		ip_local_out (pskb);
 	}
 
+err_out:
+	//kfree_skb (skb);
 	ndg_thread_running = false;
 
-	while (!skb_cloned(skb))
-		kfree_skb (skb);
+	printk (KERN_INFO "netdevgen thread finished\n");
 
 	return 0;
-
-err_out:
-	ndg_thread_running = false;
-	return -1;
 }
+
+
+static void
+start_stop (void)
+{
+	if (atomic_read (&start)) {
+		printk ("netdevgen: start -> stop\n");
+		atomic_set (&start, 0);
+	} else {
+		printk ("netdevgen: stop -> start\n");
+		atomic_set (&start, 1);
+	}
+
+	if (atomic_read (&start)) {
+		printk (KERN_INFO "restart thread\n");
+		ndg_tsk = kthread_run (netdevgen_thread, NULL, "netdevgen");
+	}
+}
+
+static ssize_t
+proc_read(struct file *fp, char *buf, size_t size, loff_t *off)
+{
+	printk (KERN_INFO "proc read\n");
+
+	//copy_to_user (buf, "stop!\n", size);
+	start_stop ();
+	return size;
+}
+
+static ssize_t
+proc_write(struct file *fp, const char *buf, size_t size, loff_t *off)
+{
+        printk("proc write\n");
+	start_stop ();
+        return size;
+}
+
+static const struct file_operations proc_file_fops = {
+	.owner = THIS_MODULE,
+	.read = proc_read,
+	.write = proc_write,
+};
 
 static int __init
 netdevgen_init (void)
 {
-	printk (KERN_INFO "start thread\n");
+	struct proc_dir_entry * ent;
 
-	ndg_tsk = kthread_run (netdevgen_thread, NULL, "netdevgen");
+        ent = proc_create(PROC_NAME, S_IRUGO | S_IWUGO | S_IXUGO,
+			  NULL, &proc_file_fops);
+        if (ent == NULL)
+                return -ENOMEM;
+
+
+	atomic_set (&start, 0);
 
 	if (IS_ERR (ndg_tsk)) {
 		printk (KERN_ERR "failed to run netdevgen thread\n");
@@ -119,6 +176,8 @@ netdevgen_init (void)
 static void __exit
 netdevgen_exit (void)
 {
+	remove_proc_entry (PROC_NAME, NULL);
+
 	if (ndg_tsk && ndg_thread_running)
 		kthread_stop (ndg_tsk);
 	else {
