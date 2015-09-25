@@ -307,9 +307,11 @@ int nf2c_tx(struct sk_buff *skb, struct net_device *dev)
 	spin_lock_irqsave(&card->txbuff_lock, flags);
 
 	if (card->free_txbuffs == 0) {
+		/*
 		if (printk_ratelimit())
 			printk(KERN_ALERT "nf2: no available transmit/receive"
 					" buffers\n");
+		*/
 		err = 1;
 	} else {
 		card->txbuff[card->wr_txbuff].skb = skb;
@@ -338,6 +340,51 @@ int nf2c_tx(struct sk_buff *skb, struct net_device *dev)
 	return err;
 }
 EXPORT_SYMBOL (nf2c_tx);
+
+int nf2c_tx_no_irq(struct sk_buff *skb, struct net_device *dev)
+{
+	int err = 0;
+	unsigned long flags;
+	struct nf2_iface_priv *iface = netdev_priv(dev);
+	struct nf2_card_priv *card = iface->card;
+
+	/* Aquire a spinlock for the buffs vbles */
+	spin_lock(&card->txbuff_lock);
+
+	if (card->free_txbuffs == 0) {
+		/*
+		if (printk_ratelimit())
+			printk(KERN_ALERT "nf2: no available transmit/receive"
+					" buffers\n");
+		*/
+		err = 1;
+	} else {
+		card->txbuff[card->wr_txbuff].skb = skb;
+		card->txbuff[card->wr_txbuff].iface = iface->iface;
+		card->wr_txbuff = (card->wr_txbuff + 1) % tx_pool_size;
+		card->free_txbuffs--;
+		card->free_txbuffs_port[iface->iface]--;
+
+		/* Stop the queue if the number of txbuffs drops to 0 */
+		if (card->free_txbuffs_port[iface->iface] == 0) {
+			PDEBUG(KERN_DFLT_DEBUG "nf2: stopping queue %d\n",
+					iface->iface);
+			netif_stop_queue(dev);
+		}
+
+		/* Attempt to send the actual packet */
+		nf2c_send(dev);
+
+		/* save the timestamp */
+		dev->trans_start = jiffies;
+	}
+
+	/*err_unlock:*/
+	spin_unlock(&card->txbuff_lock);
+
+	return err;
+}
+EXPORT_SYMBOL (nf2c_tx_no_irq);
 
 
 /**
@@ -399,8 +446,7 @@ static int nf2c_send(struct net_device *dev)
 					   PCI_DMA_TODEVICE);
 
 	/* Start the transfer */
-	iowrite32(card->dma_tx_addr,
-		  card->ioaddr + CPCI_REG_DMA_E_ADDR);
+	writel(card->dma_tx_addr,  card->ioaddr + CPCI_REG_DMA_E_ADDR);
 
 	/* Pad the skb to be at least 60 bytes. Call the padding function
 	 * to ensure that there is no information leakage */
@@ -410,9 +456,8 @@ static int nf2c_send(struct net_device *dev)
 	} else {
 		dma_len = skb->len;
 	}
-	iowrite32(dma_len,
-		  card->ioaddr + CPCI_REG_DMA_E_SIZE);
-
+	iowrite32(dma_len,  card->ioaddr + CPCI_REG_DMA_E_SIZE);
+	
 	iowrite32(NF2_SET_DMA_CTRL_MAC(rd_iface) | DMA_CTRL_OWNER,
 		  card->ioaddr + CPCI_REG_DMA_E_CTRL);
 
@@ -772,7 +817,7 @@ static irqreturn_t nf2c_intr(int irq, void *dev_id
 	u32 err;
 	u32 ctrl;
 	u32 status;
-	u32 status_orig;
+	//u32 status_orig;
 	u32 prog_status;
 	u32 int_mask;
 	u32 cnet_err;
@@ -786,6 +831,8 @@ static irqreturn_t nf2c_intr(int irq, void *dev_id
 
 	/* disable interrupts so we don't get race conditions */
 	//nf2_disable_irq(card);
+	//disable_irq_nosync (card->pdev->irq);
+
 	//smp_mb();
 
 	/* Grab the interrupt status */
@@ -794,7 +841,7 @@ static irqreturn_t nf2c_intr(int irq, void *dev_id
 		(card->ioaddr + CPCI_REG_INTERRUPT_STATUS);
 	smp_rmb ();
 
-	status_orig = status;
+	//status_orig = status;
 
 
 	if (status) {
@@ -906,6 +953,7 @@ static irqreturn_t nf2c_intr(int irq, void *dev_id
 
 				/* Call the send function if there are other
 				 * packets to send */
+
 				if (card->free_txbuffs != tx_pool_size)
 					nf2c_send(netdev);
 			}
@@ -1090,14 +1138,17 @@ static irqreturn_t nf2c_intr(int irq, void *dev_id
 
 	}
 
+	/*
 	if (status_orig) {
 		PDEBUG(KERN_DFLT_DEBUG
 		       "nf2: Reenabling interrupts: mask is 0x%08x\n",
 		       int_mask);
 	}
+	*/
 
 	/* Rewrite the interrupt mask including any changes */
 	iowrite32(int_mask, card->ioaddr + CPCI_REG_INTERRUPT_MASK);
+	//enable_irq (card->pdev->irq);
 
 	if (status)
 		return IRQ_HANDLED;
